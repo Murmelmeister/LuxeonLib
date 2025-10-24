@@ -12,6 +12,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.List;
@@ -20,8 +21,20 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.locks.ReadWriteLock;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.fail;
 
 class DatabaseTest {
     private static final int DEFAULT_PORT = 3306;
@@ -78,6 +91,70 @@ class DatabaseTest {
     }
 
     @Test
+    void testConnectUsingMissingPropertyFileThrows() {
+        Database fresh = new Database();
+        assertThrows(IllegalArgumentException.class, () -> fresh.connect("missing-properties-file.properties"));
+        fresh.getExecutor().shutdownNow();
+    }
+
+    @Test
+    void testGetExecutorReturnsActivePool() {
+        ExecutorService executor = database.getExecutor();
+        assertNotNull(executor);
+        assertFalse(executor.isShutdown());
+    }
+
+    @Test
+    void testConnectRecreatesExecutorWhenShutdown() {
+        DatabaseConfig config = config();
+        Database fresh = new Database();
+        ExecutorService shutdownExecutor = Executors.newSingleThreadExecutor();
+        shutdownExecutor.shutdownNow();
+        setExecutor(fresh, shutdownExecutor);
+
+        fresh.connect(jdbcUrl(config), config.username(), config.password());
+        ExecutorService refreshed = fresh.getExecutor();
+        assertNotSame(shutdownExecutor, refreshed);
+        assertFalse(refreshed.isShutdown());
+        fresh.disconnect();
+    }
+
+    @Test
+    void testConnectFailsWhenLockUnavailable() throws Exception {
+        Database fresh = new Database();
+        Field lockField = Database.class.getDeclaredField("lock");
+        lockField.setAccessible(true);
+        ReadWriteLock lock = (ReadWriteLock) lockField.get(fresh);
+
+        CountDownLatch ready = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread reader = new Thread(() -> {
+            lock.readLock().lock();
+            try {
+                ready.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            } finally {
+                lock.readLock().unlock();
+            }
+        });
+        reader.start();
+        ready.await();
+
+        DatabaseConfig config = config();
+        IllegalStateException exception = assertThrows(IllegalStateException.class,
+                () -> fresh.connect(jdbcUrl(config), config.username(), config.password()));
+        assertEquals("Could not acquire write lock", exception.getMessage());
+
+        release.countDown();
+        reader.join();
+        fresh.getExecutor().shutdownNow();
+    }
+
+    @Test
     void testDisconnect() {
         DatabaseConfig config = config();
         database.connect(jdbcUrl(config), config.username(), config.password());
@@ -92,6 +169,39 @@ class DatabaseTest {
     void testDisconnectIsIdempotent() {
         assertDoesNotThrow(database::disconnect);
         assertDoesNotThrow(database::disconnect);
+    }
+
+    @Test
+    void testDisconnectSkipsShutdownWhenExecutorAlreadyShutdown() {
+        Database fresh = new Database();
+        setExecutor(fresh, new AlreadyShutdownExecutor());
+        setDataSource(fresh, null);
+        assertDoesNotThrow(fresh::disconnect);
+    }
+
+    @Test
+    void testDisconnectInvokesShutdownNowOnTimeout() {
+        Database fresh = new Database();
+        TimeoutExecutor timeoutExecutor = new TimeoutExecutor();
+        setExecutor(fresh, timeoutExecutor);
+        setDataSource(fresh, null);
+
+        fresh.disconnect();
+
+        assertTrue(timeoutExecutor.shutdownCalled);
+        assertTrue(timeoutExecutor.shutdownNowCalled);
+    }
+
+    @Test
+    void testDisconnectSkipsClosingWhenDataSourceAlreadyClosed() {
+        Database fresh = new Database();
+        setExecutor(fresh, new AlreadyShutdownExecutor());
+        PreClosedDataSource dataSource = new PreClosedDataSource();
+        setDataSource(fresh, dataSource);
+
+        fresh.disconnect();
+
+        assertFalse(dataSource.closeCalled);
     }
 
     @Test
@@ -154,6 +264,59 @@ class DatabaseTest {
         assertFalse(database.exists(
                 "SELECT 1 FROM " + table + " WHERE name = ?",
                 stmt -> stmt.setString(1, "Mallory")));
+
+        String slowQuery = database.query(
+                "SELECT name FROM " + table + " WHERE name = ?",
+                "fallback",
+                rs -> rs.getString(1),
+                stmt -> {
+                    sleepSilently(1100);
+                    stmt.setString(1, "Alice");
+                });
+        assertEquals("Alice", slowQuery);
+
+        List<String> slowList = database.queryList(
+                "SELECT name FROM " + table + " WHERE name = ?",
+                rs -> rs.getString(1),
+                stmt -> {
+                    sleepSilently(1100);
+                    stmt.setString(1, "Bob");
+                });
+        assertEquals(Arrays.asList("Bob"), slowList);
+
+        boolean slowExists = database.exists(
+                "SELECT 1 FROM " + table + " WHERE name = ?",
+                stmt -> {
+                    sleepSilently(1100);
+                    stmt.setString(1, "Carol");
+                });
+        assertTrue(slowExists);
+    }
+
+    @Test
+    void testQueryHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        String table = uniqueTable("users_query_failure");
+        createUsersTable(table);
+
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.query("SELECT name FROM " + table, "fallback", rs -> rs.getString(1), stmt -> {
+                    throw new SQLException("boom");
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
+    }
+
+    @Test
+    void testQueryListHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        String table = uniqueTable("users_query_list_failure");
+        createUsersTable(table);
+
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.queryList("SELECT name FROM " + table, rs -> rs.getString(1), stmt -> {
+                    throw new SQLException("boom");
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
     }
 
     @Test
@@ -224,6 +387,83 @@ class DatabaseTest {
                 "CALL " + selectProcedure + "(?)",
                 stmt -> stmt.setString(1, "Dana"));
         assertFalse(missingCallableAsync.get(1, TimeUnit.SECONDS));
+
+        String slowCallable = database.queryCallable(
+                "CALL " + selectProcedure + "(?)",
+                "fallback",
+                rs -> rs.getString("name"),
+                stmt -> {
+                    sleepSilently(1100);
+                    stmt.setString(1, "Anna");
+                });
+        assertEquals("Anna", slowCallable);
+
+        List<String> slowCallableList = database.queryListCallable(
+                "CALL " + listProcedure + "()",
+                rs -> rs.getString("name"),
+                stmt -> sleepSilently(1100));
+        assertEquals(callableList, slowCallableList);
+
+        boolean slowExistsCallable = database.existsCallable(
+                "CALL " + selectProcedure + "(?)",
+                stmt -> {
+                    sleepSilently(1100);
+                    stmt.setString(1, "Ben");
+                });
+        assertTrue(slowExistsCallable);
+    }
+
+    @Test
+    void testQueryCallableHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.queryCallable("CALL nonexistent_procedure()", "fallback", rs -> rs.getString(1), stmt -> {
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
+    }
+
+    @Test
+    void testQueryListCallableHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.queryListCallable("CALL nonexistent_procedure()", rs -> rs.getString(1), stmt -> {
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
+    }
+
+    @Test
+    void testExistsCallableHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.existsCallable("CALL nonexistent_procedure()", stmt -> {
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
+    }
+
+    @Test
+    void testQueryCallableAsyncHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        CompletableFuture<String> future = database.queryCallableAsync(
+                "CALL nonexistent_procedure()", "fallback", rs -> rs.getString(1), stmt -> {});
+        ExecutionException executionException = assertThrows(ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
+        assertTrue(executionException.getCause() instanceof RuntimeException);
+    }
+
+    @Test
+    void testQueryListCallableAsyncHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        CompletableFuture<List<String>> future = database.queryListCallableAsync(
+                "CALL nonexistent_procedure()", rs -> rs.getString(1), stmt -> {});
+        ExecutionException executionException = assertThrows(ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
+        assertTrue(executionException.getCause() instanceof RuntimeException);
+    }
+
+    @Test
+    void testExistsCallableAsyncHandlesSQLException() throws Exception {
+        connectToFreshDatabase();
+        CompletableFuture<Boolean> future = database.existsCallableAsync("CALL nonexistent_procedure()", stmt -> {});
+        ExecutionException executionException = assertThrows(ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
+        assertTrue(executionException.getCause() instanceof RuntimeException);
     }
 
     @Test
@@ -266,9 +506,28 @@ class DatabaseTest {
     }
 
     @Test
+    void testQueryAfterDisconnectThrowsIllegalState() throws Exception {
+        connectToFreshDatabase();
+        String table = uniqueTable("users_after_disconnect");
+        createUsersTable(table);
+        database.disconnect();
+        assertThrows(IllegalStateException.class, () ->
+                database.queryList("SELECT name FROM " + table, rs -> rs.getString(1), stmt -> {}));
+    }
+
+    @Test
+    void testQueryAsyncThrowsWhenExecutorShutdown() throws Exception {
+        connectToFreshDatabase();
+        database.getExecutor().shutdownNow();
+        assertThrows(IllegalStateException.class, () ->
+                database.queryAsync("SELECT 1", 0, rs -> rs.getInt(1), stmt -> {}));
+        database.disconnect();
+    }
+
+    @Test
     void testGetAutoIncrementMissingTableReturnsNull() throws Exception {
         connectToFreshDatabase();
-        String table = "missing_" + UUID.randomUUID();
+        String table = uniqueTable("missing");
         CompletableFuture<Long> future = database.getAutoIncrement(table);
         assertNull(future.get(1, TimeUnit.SECONDS));
     }
@@ -330,6 +589,71 @@ class DatabaseTest {
     }
 
     @Test
+    void testExecuteInTransactionResetsStateOnSuccess() throws Exception {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(false, Connection.TRANSACTION_SERIALIZABLE);
+        try {
+            Integer result = executeInTransaction(fresh, state, transaction -> {
+                transaction.autoCommit = true;
+                transaction.isolation = Connection.TRANSACTION_READ_COMMITTED;
+                return 123;
+            });
+            assertEquals(123, result);
+            assertTrue(state.commitCalled);
+            assertFalse(state.rollbackCalled);
+            assertEquals(Arrays.asList(30_000, 0), state.networkTimeouts);
+            assertFalse(state.autoCommit);
+            assertEquals(Connection.TRANSACTION_SERIALIZABLE, state.isolation);
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
+    void testExecuteInTransactionRollbackOnFailure() throws Exception {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(false, Connection.TRANSACTION_SERIALIZABLE);
+        try {
+            RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                    executeInTransaction(fresh, state, transaction -> {
+                        transaction.autoCommit = false;
+                        throw new SQLException("boom");
+                    }));
+            assertEquals("Failed to execute database operation", exception.getMessage());
+            assertTrue(state.rollbackCalled);
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
+    void testExecuteInTransactionSkipsStateChangesWhenUnnecessary() throws Exception {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(true, Connection.TRANSACTION_SERIALIZABLE);
+        try {
+            Integer result = executeInTransaction(fresh, state, transaction -> {
+                transaction.autoCommit = true;
+                transaction.isolation = Connection.TRANSACTION_SERIALIZABLE;
+                return 7;
+            });
+            assertEquals(7, result.intValue());
+            assertTrue(state.commitCalled);
+            assertEquals(1, state.setAutoCommitCalls); // only initial change
+            assertEquals(0, state.setTransactionIsolationCalls); // unchanged
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
+    void testExecuteInTransactionFailureRollsBack() {
+        connectToFreshDatabase();
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                database.update("INSERT INTO non_existing_table(name) VALUES(?)", stmt -> stmt.setString(1, "X")));
+        assertEquals("Failed to execute database operation", exception.getMessage());
+    }
+
+    @Test
     void testConfigLoadsFromDotEnvOverride() throws Exception {
         Path tempDotEnv = Files.createTempFile("dotenv-test", ".env");
         Files.writeString(tempDotEnv, String.join("\n",
@@ -357,6 +681,53 @@ class DatabaseTest {
                 System.clearProperty(DOT_ENV_OVERRIDE_PROPERTY);
             resetConfigCache();
             Files.deleteIfExists(tempDotEnv);
+        }
+    }
+
+    @Test
+    void testGetAutoIncrementFailureThrowsRuntimeException() throws Exception {
+        Database stubDatabase = new Database();
+        try {
+            setExecutor(stubDatabase, Executors.newSingleThreadExecutor());
+            setDataSource(stubDatabase, new ThrowingConnectionDataSource(new SQLException("boom")));
+            CompletableFuture<Long> future = stubDatabase.getAutoIncrement("valid_name");
+            ExecutionException exception = assertThrows(ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
+            assertTrue(exception.getCause() instanceof RuntimeException);
+            assertEquals("Failed to execute query", exception.getCause().getMessage());
+        } finally {
+            setDataSource(stubDatabase, null);
+            stubDatabase.getExecutor().shutdownNow();
+            stubDatabase.disconnect();
+        }
+    }
+
+    @Test
+    void testDisconnectHandlesCloseException() throws Exception {
+        Database stubDatabase = new Database();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            setExecutor(stubDatabase, executor);
+            setDataSource(stubDatabase, new CloseThrowingDataSource(new RuntimeException("close failure")));
+            IllegalStateException exception = assertThrows(IllegalStateException.class, stubDatabase::disconnect);
+            assertEquals("Could not close database connection", exception.getMessage());
+        } finally {
+            setDataSource(stubDatabase, null);
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void testConnectClosesExistingDataSourceFailure() throws Exception {
+        Database stubDatabase = new Database();
+        DatabaseConfig config = config();
+        try {
+            setDataSource(stubDatabase, new CloseThrowingDataSource(new RuntimeException("close failure")));
+            IllegalStateException exception = assertThrows(IllegalStateException.class,
+                    () -> stubDatabase.connect(jdbcUrl(config), config.username(), config.password()));
+            assertEquals("Could not connect to database", exception.getMessage());
+        } finally {
+            setDataSource(stubDatabase, null);
+            stubDatabase.disconnect();
         }
     }
 
@@ -405,7 +776,7 @@ class DatabaseTest {
     }
 
     private Path createTemporaryPropertyFile(DatabaseConfig config) throws IOException {
-        Properties properties = loadTemplateProperties();
+        Properties properties = new Properties();
         properties.setProperty("jdbcUrl", jdbcUrl(config));
         properties.setProperty("username", config.username());
         properties.setProperty("password", config.password());
@@ -415,16 +786,6 @@ class DatabaseTest {
             properties.store(outputStream, "database test override");
         }
         return tempFile;
-    }
-
-    private Properties loadTemplateProperties() throws IOException {
-        try (InputStream inputStream = getClass().getResourceAsStream("/test-database.properties")) {
-            if (inputStream == null)
-                throw new IOException("test-database.properties resource not found");
-            Properties properties = new Properties();
-            properties.load(inputStream);
-            return properties;
-        }
     }
 
     private static synchronized DatabaseConfig config() {
@@ -505,6 +866,292 @@ class DatabaseTest {
     private static synchronized void resetConfigCache() {
         cachedConfig = null;
         dotEnvCache = null;
+    }
+
+    private static void sleepSilently(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fail("Interrupted while waiting");
+        }
+    }
+
+    private static void setDataSource(Database target, HikariDataSource value) {
+        try {
+            Field field = Database.class.getDeclaredField("dataSource");
+            field.setAccessible(true);
+            HikariDataSource previous = (HikariDataSource) field.get(target);
+            if (previous != null && !previous.isClosed()) {
+                try {
+                    previous.close();
+                } catch (Exception ignored) {
+                }
+            }
+            field.set(target, value);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void setExecutor(Database target, ExecutorService executor) {
+        try {
+            Field field = Database.class.getDeclaredField("executor");
+            field.setAccessible(true);
+            ExecutorService previous = (ExecutorService) field.get(target);
+            if (previous != null && !previous.isShutdown())
+                previous.shutdownNow();
+            field.set(target, executor);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static final class AlreadyShutdownExecutor extends AbstractExecutorService {
+        @Override
+        public void shutdown() {
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return true;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return true;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return true;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+        }
+    }
+
+    private static final class TimeoutExecutor extends AbstractExecutorService {
+        private boolean shutdownCalled;
+        private boolean shutdownNowCalled;
+
+        @Override
+        public void shutdown() {
+            shutdownCalled = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdownNowCalled = true;
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdownCalled;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdownCalled && shutdownNowCalled;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return false;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+        }
+    }
+
+    private static final class PreClosedDataSource extends HikariDataSource {
+        private boolean closeCalled;
+
+        @Override
+        public Connection getConnection() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isClosed() {
+            return true;
+        }
+
+        @Override
+        public void close() {
+            closeCalled = true;
+        }
+    }
+
+    private static final class SingleConnectionDataSource extends HikariDataSource {
+        private final Connection connection;
+        private boolean closed;
+
+        SingleConnectionDataSource(Connection connection) {
+            this.connection = connection;
+        }
+
+        @Override
+        public Connection getConnection() {
+            return connection;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return closed;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+    }
+
+    private static final class TransactionState {
+        boolean autoCommit;
+        int isolation;
+        boolean closed;
+        boolean readOnly;
+        boolean commitCalled;
+        boolean rollbackCalled;
+        int setAutoCommitCalls;
+        int setTransactionIsolationCalls;
+        int setReadOnlyCalls;
+        final List<Integer> networkTimeouts = new ArrayList<>();
+
+        TransactionState(boolean autoCommit, int isolation) {
+            this.autoCommit = autoCommit;
+            this.isolation = isolation;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ConnectionBody<T> {
+        T apply(TransactionState state) throws SQLException;
+    }
+
+    private static Connection createTestConnection(TransactionState state) {
+        return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class[]{Connection.class},
+                (proxy, method, args) -> {
+                    String name = method.getName();
+                    switch (name) {
+                        case "getAutoCommit":
+                            return state.autoCommit;
+                        case "setAutoCommit":
+                            state.autoCommit = (Boolean) args[0];
+                            state.setAutoCommitCalls++;
+                            return null;
+                        case "getTransactionIsolation":
+                            return state.isolation;
+                        case "setTransactionIsolation":
+                            state.isolation = (Integer) args[0];
+                            state.setTransactionIsolationCalls++;
+                            return null;
+                        case "setReadOnly":
+                            state.readOnly = (Boolean) args[0];
+                            state.setReadOnlyCalls++;
+                            return null;
+                        case "setNetworkTimeout":
+                            state.networkTimeouts.add((Integer) args[1]);
+                            return null;
+                        case "commit":
+                            state.commitCalled = true;
+                            return null;
+                        case "rollback":
+                            state.rollbackCalled = true;
+                            return null;
+                        case "close":
+                            state.closed = true;
+                            return null;
+                        case "isClosed":
+                            return state.closed;
+                        case "unwrap":
+                            return null;
+                        case "isWrapperFor":
+                            return false;
+                        case "getHoldability":
+                            return ResultSet.HOLD_CURSORS_OVER_COMMIT;
+                        default:
+                            throw new UnsupportedOperationException(name);
+                    }
+                });
+    }
+
+    private static <T> T executeInTransaction(Database database, TransactionState state, ConnectionBody<T> body) throws Exception {
+        setDataSource(database, new SingleConnectionDataSource(createTestConnection(state)));
+        setExecutor(database, Executors.newSingleThreadExecutor());
+        Class<?> opClass = Class.forName("de.murmelmeister.luxeonlib.database.Database$ConnectionOperation");
+        Method method = Database.class.getDeclaredMethod("executeInTransaction", opClass);
+        method.setAccessible(true);
+        Object operation = Proxy.newProxyInstance(
+                opClass.getClassLoader(),
+                new Class[]{opClass},
+                (proxy, invokedMethod, args) -> {
+                    if ("execute".equals(invokedMethod.getName()))
+                        return body.apply(state);
+                    throw new UnsupportedOperationException(invokedMethod.getName());
+                });
+        try {
+            @SuppressWarnings("unchecked")
+            T result = (T) method.invoke(database, operation);
+            return result;
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            if (cause instanceof Error) throw (Error) cause;
+            throw new RuntimeException(cause);
+        }
+    }
+
+    private static final class ThrowingConnectionDataSource extends HikariDataSource {
+        private final SQLException exception;
+
+        ThrowingConnectionDataSource(SQLException exception) {
+            this.exception = exception;
+        }
+
+        @Override
+        public Connection getConnection() throws SQLException {
+            throw exception;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return false;
+        }
+
+        @Override
+        public void close() {
+            // no-op
+        }
+    }
+
+    private static final class CloseThrowingDataSource extends HikariDataSource {
+        private final RuntimeException closeException;
+
+        CloseThrowingDataSource(RuntimeException closeException) {
+            this.closeException = closeException;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return false;
+        }
+
+        @Override
+        public void close() {
+            throw closeException;
+        }
     }
 
     private record DatabaseConfig(String host, int port, String database, String username, String password) {
