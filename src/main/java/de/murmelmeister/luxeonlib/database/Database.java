@@ -17,6 +17,21 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 
+/**
+ * The Database class provides functionality to manage database connections,
+ * perform update and query operations, and handle transaction management.
+ * It includes methods for connecting to the database, executing SQL updates,
+ * performing batch operations, callable statements, and executing both synchronous
+ * and asynchronous queries with configurable processors.
+ * <p>
+ * Fields: <p>
+ * - logger: Provides logging capabilities for the database operations. <p>
+ * - lock: A ReentrantReadWriteLock used to ensure thread-safe operations when managing connections. <p>
+ * - executor: A thread pool executor to handle asynchronous operations. <p>
+ * - dataSource: The HikariDataSource object to manage database connections. <p>
+ * - NAME_PATTERN: A predefined pattern used for name validation. <p>
+ * - SLOW_QUERY_THRESHOLD_MS: A threshold in milliseconds to log slow queries for performance monitoring.
+ */
 public class Database {
     private final Logger logger = LoggerFactory.getLogger(Database.class);
     private final ReadWriteLock lock = new ReentrantReadWriteLock(true);
