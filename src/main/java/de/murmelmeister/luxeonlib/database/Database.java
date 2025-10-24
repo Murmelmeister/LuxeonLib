@@ -33,14 +33,14 @@ import java.util.regex.Pattern;
  * - SLOW_QUERY_THRESHOLD_MS: A threshold in milliseconds to log slow queries for performance monitoring.
  */
 public class Database {
+    private static final long SLOW_QUERY_THRESHOLD_MS = 1000;
+    private static final int EXECUTOR_POOL_SIZE = 10;
+
     private final Logger logger = LoggerFactory.getLogger(Database.class);
     private final ReadWriteLock lock = new ReentrantReadWriteLock(true);
-    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+    private volatile ExecutorService executor = createExecutor();
     private volatile HikariDataSource dataSource;
     private static final Pattern NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_]+");
-
-    // Threshold in milliseconds for slow queries.
-    private static final long SLOW_QUERY_THRESHOLD_MS = 1000;
 
     /**
      * Establishes a connection to the database using the properties defined in the specified file.
@@ -109,6 +109,9 @@ public class Database {
             if (dataSource != null && !dataSource.isClosed())
                 dataSource.close();
 
+            if (executor == null || executor.isShutdown())
+                executor = createExecutor();
+
             dataSource = new HikariDataSource(config);
             logger.info("Database connection established successfully. URL: {}", dataSource.getJdbcUrl());
         } catch (Exception e) {
@@ -135,6 +138,9 @@ public class Database {
      *                               or if there are errors while closing the data source.
      */
     public void disconnect() {
+        HikariDataSource dataSourceToClose;
+        ExecutorService executorToShutdown;
+
         try {
             if (!lock.writeLock().tryLock(10, TimeUnit.SECONDS))
                 throw new IllegalStateException("Could not acquire write lock");
@@ -144,25 +150,32 @@ public class Database {
         }
 
         try {
-            if (dataSource != null && !dataSource.isClosed()) {
-                dataSource.close();
-                dataSource = null;
-                logger.info("Database connection closed successfully");
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException("Could not close database connection", e);
+            dataSourceToClose = dataSource;
+            dataSource = null;
+            executorToShutdown = executor;
+            executor = null;
         } finally {
             lock.writeLock().unlock();
         }
 
-        if (!executor.isShutdown()) {
-            executor.shutdown();
+        if (executorToShutdown != null && !executorToShutdown.isShutdown()) {
+            executorToShutdown.shutdown();
             try {
-                if (!executor.awaitTermination(10, TimeUnit.SECONDS))
-                    executor.shutdownNow();
+                if (!executorToShutdown.awaitTermination(10, TimeUnit.SECONDS))
+                    executorToShutdown.shutdownNow();
             } catch (InterruptedException e) {
-                executor.shutdownNow();
+                executorToShutdown.shutdownNow();
                 Thread.currentThread().interrupt();
+            }
+        }
+
+        if (dataSourceToClose != null) {
+            try {
+                if (!dataSourceToClose.isClosed())
+                    dataSourceToClose.close();
+                logger.info("Database connection closed successfully");
+            } catch (Exception e) {
+                throw new IllegalStateException("Could not close database connection", e);
             }
         }
     }
@@ -254,7 +267,7 @@ public class Database {
      */
     public <T> T query(String sql, T fallback, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              PreparedStatement statement = getPreparedStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             if (resultSet.next())
@@ -283,7 +296,7 @@ public class Database {
      */
     public <T> T queryCallable(String sql, T fallback, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              CallableStatement statement = getCallableStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             if (resultSet.next())
@@ -311,7 +324,8 @@ public class Database {
      * @return A CompletableFuture representing the result of the asynchronous query
      */
     public <T> CompletableFuture<T> queryAsync(String sql, T fallback, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> query(sql, fallback, processor, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> query(sql, fallback, processor, parameters), asyncExecutor);
     }
 
     /**
@@ -325,7 +339,8 @@ public class Database {
      * @return A CompletableFuture containing the result of the processed query.
      */
     public <T> CompletableFuture<T> queryCallableAsync(String sql, T fallback, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> queryCallable(sql, fallback, processor, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> queryCallable(sql, fallback, processor, parameters), asyncExecutor);
     }
 
     /**
@@ -340,7 +355,7 @@ public class Database {
      */
     public <T> List<T> queryList(String sql, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              PreparedStatement statement = getPreparedStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             List<T> list = new ArrayList<>();
@@ -369,7 +384,7 @@ public class Database {
      */
     public <T> List<T> queryListCallable(String sql, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              CallableStatement statement = getCallableStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             List<T> list = new ArrayList<>();
@@ -396,7 +411,8 @@ public class Database {
      * @return A CompletableFuture containing the list of results of type T.
      */
     public <T> CompletableFuture<List<T>> queryListAsync(String sql, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> queryList(sql, processor, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> queryList(sql, processor, parameters), asyncExecutor);
     }
 
     /**
@@ -409,7 +425,8 @@ public class Database {
      * @return A CompletableFuture containing a list of objects of type T resulting from the query
      */
     public <T> CompletableFuture<List<T>> queryListCallableAsync(String sql, ResultSetProcessor<T> processor, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> queryListCallable(sql, processor, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> queryListCallable(sql, processor, parameters), asyncExecutor);
     }
 
     /**
@@ -424,7 +441,7 @@ public class Database {
      */
     public boolean exists(String sql, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              PreparedStatement statement = getPreparedStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             return resultSet.next();
@@ -448,7 +465,7 @@ public class Database {
      */
     public boolean existsCallable(String sql, ParameterProcessor parameters) {
         long startTime = System.nanoTime();
-        try (Connection connection = dataSource.getConnection();
+        try (Connection connection = requireDataSource().getConnection();
              CallableStatement statement = getCallableStatement(connection, sql, parameters);
              ResultSet resultSet = statement.executeQuery()) {
             return resultSet.next();
@@ -470,7 +487,8 @@ public class Database {
      * @return A CompletableFuture which resolves to a Boolean indicating whether a record exists (true) or not (false)
      */
     public CompletableFuture<Boolean> existsAsync(String sql, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> exists(sql, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> exists(sql, parameters), asyncExecutor);
     }
 
     /**
@@ -483,7 +501,8 @@ public class Database {
      * statement exists (true) or not (false)
      */
     public CompletableFuture<Boolean> existsCallableAsync(String sql, ParameterProcessor parameters) {
-        return CompletableFuture.supplyAsync(() -> existsCallable(sql, parameters), executor);
+        ExecutorService asyncExecutor = requireExecutor();
+        return CompletableFuture.supplyAsync(() -> existsCallable(sql, parameters), asyncExecutor);
     }
 
     /**
@@ -504,8 +523,9 @@ public class Database {
             throw new IllegalArgumentException("Invalid table name: " + tableName);
 
         String sql = "SHOW TABLE STATUS LIKE ?";
+        ExecutorService asyncExecutor = requireExecutor();
         return CompletableFuture.supplyAsync(() -> {
-            try (Connection connection = dataSource.getConnection();
+            try (Connection connection = requireDataSource().getConnection();
                  PreparedStatement statement = getPreparedStatement(connection, sql, (stmt) -> stmt.setString(1, tableName));
                  ResultSet resultSet = statement.executeQuery()) {
                 if (resultSet.next())
@@ -518,7 +538,7 @@ public class Database {
                 logger.error("Failed to retrieve auto-increment value for table [{}]", tableName);
                 throw new RuntimeException("Failed to execute query", e);
             }
-        }, executor);
+        }, asyncExecutor);
     }
 
     /**
@@ -554,9 +574,11 @@ public class Database {
         Connection connection = null;
         boolean previousAutoCommit = true;
         int previousIsolation = Connection.TRANSACTION_READ_COMMITTED;
+        ExecutorService networkExecutor = requireExecutor();
+        HikariDataSource currentDataSource = requireDataSource();
 
         try {
-            connection = dataSource.getConnection();
+            connection = currentDataSource.getConnection();
 
             previousAutoCommit = connection.getAutoCommit();
             previousIsolation = connection.getTransactionIsolation();
@@ -567,7 +589,7 @@ public class Database {
                 connection.setTransactionIsolation(desiredIsolation);
 
             connection.setReadOnly(false);
-            connection.setNetworkTimeout(executor, 30_000); // Set network timeout to 30 seconds
+            connection.setNetworkTimeout(networkExecutor, 30_000); // Set network timeout to 30 seconds
 
             T result = operation.execute(connection);
             connection.commit();
@@ -596,7 +618,7 @@ public class Database {
                         connection.setTransactionIsolation(previousIsolation);
 
                     connection.setReadOnly(false);
-                    connection.setNetworkTimeout(executor, 0);
+                    connection.setNetworkTimeout(networkExecutor, 0);
                 } catch (SQLException e) {
                     logger.error("Failed to reset database connection", e);
                 } finally {
@@ -702,6 +724,44 @@ public class Database {
      */
     public ExecutorService getExecutor() {
         return executor;
+    }
+
+    /**
+     * Creates and returns an instance of a fixed thread pool ExecutorService with a predefined pool size.
+     *
+     * @return An ExecutorService configured as a fixed thread pool with a size set by the constant EXECUTOR_POOL_SIZE
+     */
+    private ExecutorService createExecutor() {
+        return Executors.newFixedThreadPool(EXECUTOR_POOL_SIZE);
+    }
+
+    /**
+     * Ensures that an active {@link ExecutorService} is available.
+     * This method checks if the current executor service is not null and not shut down.
+     * If the executor service is unavailable, an {@link IllegalStateException} is thrown.
+     *
+     * @return The active {@link ExecutorService} instance.
+     * @throws IllegalStateException If the executor service is null or has been shut down.
+     */
+    private ExecutorService requireExecutor() {
+        ExecutorService currentExecutor = executor;
+        if (currentExecutor == null || currentExecutor.isShutdown())
+            throw new IllegalStateException("Database is not connected");
+        return currentExecutor;
+    }
+
+    /**
+     * Ensures that a data source is available and returns the current {@code HikariDataSource}.
+     * If no data source is available, an {@code IllegalStateException} is thrown.
+     *
+     * @return The currently configured {@code HikariDataSource}
+     * @throws IllegalStateException If no data source is connected
+     */
+    private HikariDataSource requireDataSource() {
+        HikariDataSource currentDataSource = dataSource;
+        if (currentDataSource == null)
+            throw new IllegalStateException("Database is not connected");
+        return currentDataSource;
     }
 
     /**
