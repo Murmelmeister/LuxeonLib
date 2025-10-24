@@ -16,6 +16,8 @@ repositories {
 dependencies {
     implementation("com.zaxxer:HikariCP:7.0.2")
     implementation("org.slf4j:slf4j-simple:2.0.17")
+    testImplementation("org.mariadb.jdbc:mariadb-java-client:3.4.1")
+    testImplementation("io.github.cdimascio:java-dotenv:5.2.2")
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
