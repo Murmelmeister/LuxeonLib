@@ -37,6 +37,7 @@ import java.util.concurrent.locks.ReadWriteLock;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assertions.fail;
 
+// AI generated
 class DatabaseTest {
     private static final int DEFAULT_PORT = 3306;
     private static final String DOT_ENV_OVERRIDE_PROPERTY = "luxeonlib.dotenv.path";
