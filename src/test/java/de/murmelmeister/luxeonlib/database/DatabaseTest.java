@@ -12,6 +12,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Arrays;
@@ -120,6 +121,21 @@ class DatabaseTest {
     }
 
     @Test
+    void testConnectCreatesExecutorWhenMissing() {
+        DatabaseConfig config = config();
+        Database fresh = new Database();
+        setExecutor(fresh, null);
+
+        fresh.connect(jdbcUrl(config), config.username(), config.password());
+        try {
+            assertNotNull(fresh.getExecutor(), "Executor should be recreated when missing");
+            assertFalse(fresh.getExecutor().isShutdown());
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
     void testConnectFailsWhenLockUnavailable() throws Exception {
         Database fresh = new Database();
         Field lockField = Database.class.getDeclaredField("lock");
@@ -190,6 +206,22 @@ class DatabaseTest {
 
         assertTrue(timeoutExecutor.shutdownCalled);
         assertTrue(timeoutExecutor.shutdownNowCalled);
+    }
+
+    @Test
+    void testDisconnectHandlesAwaitTerminationInterruption() {
+        Database fresh = new Database();
+        InterruptingExecutor interruptingExecutor = new InterruptingExecutor();
+        setExecutor(fresh, interruptingExecutor);
+        setDataSource(fresh, null);
+
+        Thread.interrupted();
+        fresh.disconnect();
+
+        assertTrue(interruptingExecutor.shutdownCalled);
+        assertTrue(interruptingExecutor.shutdownNowCalled);
+        assertTrue(Thread.currentThread().isInterrupted());
+        Thread.interrupted();
     }
 
     @Test
@@ -317,6 +349,21 @@ class DatabaseTest {
                     throw new SQLException("boom");
                 }));
         assertEquals("Failed to execute query", exception.getMessage());
+    }
+
+    @Test
+    void testExistsHandlesSQLException() {
+        Database fresh = new Database();
+        SQLException failure = new SQLException("boom");
+        setDataSource(fresh, new SingleConnectionDataSource(createExistsFailureConnection(failure)));
+
+        RuntimeException exception = assertThrows(RuntimeException.class,
+                () -> fresh.exists("SELECT 1", stmt -> {
+                }));
+        assertEquals("Failed to execute query", exception.getMessage());
+        assertSame(failure, exception.getCause());
+
+        fresh.disconnect();
     }
 
     @Test
@@ -546,6 +593,24 @@ class DatabaseTest {
     }
 
     @Test
+    void testUpdateAndGetGeneratedKeysThrowsWhenGeneratedKeyMissing() {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(true, Connection.TRANSACTION_READ_COMMITTED);
+        PreparedStatement generatedKeysStatement = createGeneratedKeylessStatement();
+        Connection connection = createTransactionAwareConnection(state, null, generatedKeysStatement);
+        setDataSource(fresh, new SingleConnectionDataSource(connection));
+
+        RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                fresh.updateAndGetGeneratedKeys("INSERT INTO dummy(name) VALUES(?)", stmt -> {
+                }));
+        assertEquals("Failed to execute database operation", exception.getMessage());
+        assertTrue(exception.getCause() instanceof SQLException);
+        assertEquals("No generated keys returned", exception.getCause().getMessage());
+
+        fresh.disconnect();
+    }
+
+    @Test
     void testProcedureQueryValidation() {
         String procedureSql = Database.getProcedureQuery(
                 "test_proc",
@@ -640,6 +705,39 @@ class DatabaseTest {
             assertTrue(state.commitCalled);
             assertEquals(1, state.setAutoCommitCalls); // only initial change
             assertEquals(0, state.setTransactionIsolationCalls); // unchanged
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
+    void testExecuteInTransactionAdjustsIsolationAndRestores() throws Exception {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(false, Connection.TRANSACTION_READ_COMMITTED);
+        try {
+            Integer result = executeInTransaction(fresh, state, transaction -> 99);
+            assertEquals(99, result.intValue());
+            assertTrue(state.commitCalled);
+            assertEquals(2, state.setTransactionIsolationCalls);
+            assertEquals(Arrays.asList(30_000, 0), state.networkTimeouts);
+            assertEquals(Connection.TRANSACTION_READ_COMMITTED, state.isolation);
+        } finally {
+            fresh.disconnect();
+        }
+    }
+
+    @Test
+    void testExecuteInTransactionSkipsRollbackWhenAutoCommitRestored() throws Exception {
+        Database fresh = new Database();
+        TransactionState state = new TransactionState(true, Connection.TRANSACTION_SERIALIZABLE);
+        try {
+            RuntimeException exception = assertThrows(RuntimeException.class, () ->
+                    executeInTransaction(fresh, state, transaction -> {
+                        transaction.autoCommit = true;
+                        throw new RuntimeException("boom");
+                    }));
+            assertEquals("Failed to execute database operation", exception.getMessage());
+            assertFalse(state.rollbackCalled);
         } finally {
             fresh.disconnect();
         }
@@ -972,6 +1070,41 @@ class DatabaseTest {
         }
     }
 
+    private static final class InterruptingExecutor extends AbstractExecutorService {
+        private boolean shutdownCalled;
+        private boolean shutdownNowCalled;
+
+        @Override
+        public void shutdown() {
+            shutdownCalled = true;
+        }
+
+        @Override
+        public List<Runnable> shutdownNow() {
+            shutdownNowCalled = true;
+            return Collections.emptyList();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdownCalled;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdownNowCalled;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+            throw new InterruptedException("forced interruption");
+        }
+
+        @Override
+        public void execute(Runnable command) {
+        }
+    }
+
     private static final class PreClosedDataSource extends HikariDataSource {
         private boolean closeCalled;
 
@@ -1039,6 +1172,10 @@ class DatabaseTest {
     }
 
     private static Connection createTestConnection(TransactionState state) {
+        return createTransactionAwareConnection(state, null, null);
+    }
+
+    private static Connection createTransactionAwareConnection(TransactionState state, PreparedStatement preparedStatement, PreparedStatement generatedKeysStatement) {
         return (Connection) Proxy.newProxyInstance(
                 Connection.class.getClassLoader(),
                 new Class[]{Connection.class},
@@ -1075,6 +1212,20 @@ class DatabaseTest {
                             return null;
                         case "isClosed":
                             return state.closed;
+                        case "prepareStatement":
+                            if (args == null || args.length == 0)
+                                throw new UnsupportedOperationException("prepareStatement without arguments");
+                            if (args.length == 1) {
+                                if (preparedStatement != null)
+                                    return preparedStatement;
+                                throw new UnsupportedOperationException("prepareStatement not configured");
+                            }
+                            if (args.length == 2 && args[1] instanceof Integer && ((Integer) args[1]) == PreparedStatement.RETURN_GENERATED_KEYS) {
+                                if (generatedKeysStatement != null)
+                                    return generatedKeysStatement;
+                                throw new UnsupportedOperationException("generated keys statement not configured");
+                            }
+                            throw new UnsupportedOperationException("prepareStatement overload");
                         case "unwrap":
                             return null;
                         case "isWrapperFor":
@@ -1111,6 +1262,96 @@ class DatabaseTest {
             if (cause instanceof Error) throw (Error) cause;
             throw new RuntimeException(cause);
         }
+    }
+
+    private static Connection createExistsFailureConnection(SQLException failure) {
+        PreparedStatement failingStatement = (PreparedStatement) Proxy.newProxyInstance(
+                PreparedStatement.class.getClassLoader(),
+                new Class[]{PreparedStatement.class},
+                (proxy, method, args) -> {
+                    String name = method.getName();
+                    switch (name) {
+                        case "executeQuery":
+                            throw failure;
+                        case "close":
+                            return null;
+                        case "unwrap":
+                            return null;
+                        case "isWrapperFor":
+                            return false;
+                        default:
+                            throw new UnsupportedOperationException(name);
+                    }
+                });
+
+        boolean[] closed = {false};
+        return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class[]{Connection.class},
+                (proxy, method, args) -> {
+                    String name = method.getName();
+                    switch (name) {
+                        case "prepareStatement":
+                            return failingStatement;
+                        case "close":
+                            closed[0] = true;
+                            return null;
+                        case "isClosed":
+                            return closed[0];
+                        case "unwrap":
+                            return null;
+                        case "isWrapperFor":
+                            return false;
+                        case "getAutoCommit":
+                            return true;
+                        case "getTransactionIsolation":
+                            return Connection.TRANSACTION_READ_COMMITTED;
+                        default:
+                            throw new UnsupportedOperationException(name);
+                    }
+                });
+    }
+
+    private static PreparedStatement createGeneratedKeylessStatement() {
+        ResultSet emptyGeneratedKeys = (ResultSet) Proxy.newProxyInstance(
+                ResultSet.class.getClassLoader(),
+                new Class[]{ResultSet.class},
+                (proxy, method, args) -> {
+                    String name = method.getName();
+                    switch (name) {
+                        case "next":
+                            return false;
+                        case "close":
+                            return null;
+                        case "unwrap":
+                            return null;
+                        case "isWrapperFor":
+                            return false;
+                        default:
+                            throw new UnsupportedOperationException(name);
+                    }
+                });
+
+        return (PreparedStatement) Proxy.newProxyInstance(
+                PreparedStatement.class.getClassLoader(),
+                new Class[]{PreparedStatement.class},
+                (proxy, method, args) -> {
+                    String name = method.getName();
+                    switch (name) {
+                        case "executeUpdate":
+                            return 1;
+                        case "getGeneratedKeys":
+                            return emptyGeneratedKeys;
+                        case "close":
+                            return null;
+                        case "unwrap":
+                            return null;
+                        case "isWrapperFor":
+                            return false;
+                        default:
+                            throw new UnsupportedOperationException(name);
+                    }
+                });
     }
 
     private static final class ThrowingConnectionDataSource extends HikariDataSource {
